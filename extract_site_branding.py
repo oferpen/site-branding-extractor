@@ -20,7 +20,7 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; BrandExtractor/1.0)'}
 LOGO_HINTS = re.compile(r'logo', re.IGNORECASE)
 
 
-def find_logo_url(soup, base_url):
+def get_logo_candidates(soup, base_url):
     candidates = []
 
     # Favicons / touch icons are the most reliable brand mark: small, square,
@@ -61,11 +61,8 @@ def find_logo_url(soup, base_url):
     if og_image and og_image.get('content'):
         candidates.append((1, urljoin(base_url, og_image['content'])))
 
-    if not candidates:
-        return None
-
     candidates.sort(key=lambda c: c[0], reverse=True)
-    return candidates[0][1]
+    return [url for _, url in candidates]
 
 
 def is_near_white_or_gray(r, g, b, threshold=18):
@@ -114,12 +111,28 @@ def analyze_site(url, n_colors=5):
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
 
-    logo_url = find_logo_url(soup, url)
-    if not logo_url:
+    candidates = get_logo_candidates(soup, url)
+    if not candidates:
         raise ValueError(f'no logo found for {url}')
 
-    logo_resp = requests.get(logo_url, headers=HEADERS, timeout=15)
-    logo_resp.raise_for_status()
+    # Some sites (SPAs with catch-all routing) return 200 OK with an HTML
+    # page for a nonexistent image path, so a candidate isn't trustworthy
+    # until its response actually looks like an image.
+    logo_url = None
+    logo_resp = None
+    for candidate_url in candidates:
+        try:
+            candidate_resp = requests.get(candidate_url, headers=HEADERS, timeout=15)
+            candidate_resp.raise_for_status()
+        except requests.exceptions.RequestException:
+            continue
+        if candidate_resp.headers.get('Content-Type', '').startswith('image/'):
+            logo_url = candidate_url
+            logo_resp = candidate_resp
+            break
+
+    if not logo_resp:
+        raise ValueError(f'no logo found for {url}')
 
     try:
         colors = extract_colors(logo_resp.content, n=n_colors)

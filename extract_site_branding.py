@@ -182,6 +182,97 @@ def extract_colors(image_bytes, n=8):
     return hex_colors[:n]
 
 
+# Custom-property name prefixes that mark a color as a generic framework
+# default rather than something the site itself chose (WordPress core /
+# Gutenberg editor palette, WP admin color schemes, etc).
+FRAMEWORK_CUSTOM_PROP_PREFIXES = (
+    '--wp--preset--color',
+    '--wp-admin-theme-color',
+    '--wp-components-color',
+    '--wp-block',
+)
+
+# Stylesheet hosts that serve generic fonts/frameworks, never a site's own
+# brand colors — not worth fetching.
+SKIP_STYLESHEET_HOSTS = (
+    'fonts.googleapis.com',
+    'fonts.gstatic.com',
+    'cdnjs.cloudflare.com',
+    'cdn.jsdelivr.net',
+    'unpkg.com',
+    'stackpath.bootstrapcdn.com',
+    'maxcdn.bootstrapcdn.com',
+    'use.fontawesome.com',
+    'use.typekit.net',
+)
+
+CUSTOM_PROP_RE = re.compile(r'(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{3,6})\b')
+
+
+def _hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def get_css_colors(soup, base_url, n=5, max_stylesheets=3, max_css_bytes=400_000):
+    """Best-effort brand colors from the site's own CSS: linked stylesheets
+    plus inline <style> blocks. Framework/editor default colors (identified
+    by the CSS custom-property name that defines them, e.g. WordPress's
+    --wp--preset--color--* palette) are excluded so they don't drown out
+    colors the site actually chose. Still just a frequency heuristic over
+    static CSS — it can't tell a rarely-used accent from real brand color,
+    and misses anything set via JS or component-scoped styles.
+    """
+    css_chunks = [tag.get_text() for tag in soup.find_all('style')]
+
+    stylesheet_urls = []
+    for link in soup.find_all('link'):
+        rel = link.get('rel') or []
+        href = link.get('href')
+        if href and 'stylesheet' in ' '.join(rel).lower():
+            stylesheet_urls.append(urljoin(base_url, href))
+
+    fetched = 0
+    for sheet_url in stylesheet_urls:
+        if fetched >= max_stylesheets:
+            break
+        if any(host in sheet_url for host in SKIP_STYLESHEET_HOSTS):
+            continue
+        try:
+            resp = requests.get(sheet_url, headers=HEADERS, timeout=10)
+            resp.raise_for_status()
+        except requests.exceptions.RequestException:
+            continue
+        css_chunks.append(resp.text[:max_css_bytes])
+        fetched += 1
+
+    css = '\n'.join(css_chunks)
+    if not css:
+        return []
+
+    framework_colors = {
+        _normalize_hex(value.lstrip('#'))
+        for name, value in CUSTOM_PROP_RE.findall(css)
+        if name.startswith(FRAMEWORK_CUSTOM_PROP_PREFIXES)
+    }
+
+    counts = {}
+    for match in HEX_COLOR_RE.finditer(css):
+        color = _normalize_hex(match.group(1))
+        if color in framework_colors:
+            continue
+        try:
+            r, g, b = _hex_to_rgb(color)
+        except ValueError:
+            continue
+        if is_near_white_or_gray(r, g, b):
+            continue
+        counts[color] = counts.get(color, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    return [color for color, _ in ranked[:n]]
+
+
 def colors_from_asset(asset, n=8):
     """extract_colors/extract_svg_colors dispatch based on the asset's content type."""
     if not asset:
@@ -265,6 +356,9 @@ def analyze_site(url, n_colors=6):
     color_votes.extend(colors_from_asset(logo))
     if icon and icon is not logo:
         color_votes.extend(colors_from_asset(icon))
+    # CSS colors are the noisiest signal (framework defaults can leak
+    # through), so give each only a small vote relative to logo/icon/theme.
+    color_votes.extend(get_css_colors(soup, url) * 2)
 
     brand_colors = rank_colors(color_votes, n=n_colors)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract a website's logo and dominant colors.
+"""Extract a website's logo, icon, cover image, and brand colors.
 
 Usage:
     python3 extract_site_branding.py <url> [--out DIR] [--colors N]
@@ -20,20 +20,29 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; BrandExtractor/1.0)'}
 LOGO_HINTS = re.compile(r'logo', re.IGNORECASE)
 
 
-def get_logo_candidates(soup, base_url):
+def find_icon_candidates(soup, base_url):
+    """Favicon / touch-icon links, most specific (apple-touch-icon) first."""
     candidates = []
 
-    # Favicons / touch icons are the most reliable brand mark: small, square,
-    # not prone to matching unrelated marketing images that happen to mention "logo".
-    # (Filtering by a lambda on `rel=` directly doesn't reliably match this
-    # multi-valued attribute in BeautifulSoup, so filter manually instead.)
+    # Filtering by a lambda on `rel=` directly doesn't reliably match this
+    # multi-valued attribute in BeautifulSoup, so filter manually instead.
     for link in soup.find_all('link'):
         rel = link.get('rel') or []
         rel_str = ' '.join(rel).lower()
         href = link.get('href')
         if href and 'icon' in rel_str:
-            score = 6 if 'apple-touch' in rel_str else 5
+            score = 2 if 'apple-touch' in rel_str else 1
             candidates.append((score, urljoin(base_url, href)))
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    urls = [url for _, url in candidates]
+    urls.append(urljoin(base_url, '/favicon.ico'))
+    return urls
+
+
+def find_logo_candidates(soup, base_url):
+    """The site's actual wordmark/logo image, as distinct from its icon."""
+    candidates = []
 
     for img in soup.find_all('img'):
         src = img.get('src') or img.get('data-src')
@@ -48,21 +57,46 @@ def get_logo_candidates(soup, base_url):
         src_match = LOGO_HINTS.search(filename)
         alt_match = LOGO_HINTS.search(img.get('alt') or '')
 
+        # Only trust a "logo" hint when the image also sits in the header/nav —
+        # a match anywhere on the page (e.g. a customer-logo showcase section)
+        # is too likely to be unrelated to the site's own brand mark.
         if name_or_id_match and in_header:
             candidates.append((4, urljoin(base_url, src)))
         elif src_match and in_header:
             candidates.append((3, urljoin(base_url, src)))
-        elif name_or_id_match:
-            candidates.append((2, urljoin(base_url, src)))
         elif alt_match and in_header:
             candidates.append((2, urljoin(base_url, src)))
 
-    og_image = soup.find('meta', property='og:image')
-    if og_image and og_image.get('content'):
-        candidates.append((1, urljoin(base_url, og_image['content'])))
-
     candidates.sort(key=lambda c: c[0], reverse=True)
     return [url for _, url in candidates]
+
+
+def find_cover_image_candidates(soup, base_url):
+    """The site's social-share preview image (og:image / twitter:image)."""
+    candidates = []
+
+    for prop in ('og:image:secure_url', 'og:image'):
+        tag = soup.find('meta', property=prop)
+        if tag and tag.get('content'):
+            candidates.append(urljoin(base_url, tag['content']))
+
+    tag = soup.find('meta', attrs={'name': 'twitter:image'})
+    if tag and tag.get('content'):
+        candidates.append(urljoin(base_url, tag['content']))
+
+    return candidates
+
+
+def find_theme_color(soup):
+    """An explicit brand color the site declares itself, if any."""
+    for name in ('theme-color', 'msapplication-TileColor'):
+        tag = soup.find('meta', attrs={'name': name})
+        if not tag or not tag.get('content'):
+            continue
+        content = tag['content'].strip()
+        if re.match(r'^#[0-9a-fA-F]{3}$', content) or re.match(r'^#[0-9a-fA-F]{6}$', content):
+            return _normalize_hex(content.lstrip('#'))
+    return None
 
 
 HEX_COLOR_RE = re.compile(r'#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b')
@@ -77,7 +111,7 @@ def _normalize_hex(hex_value):
     return '#' + hex_value
 
 
-def extract_svg_colors(svg_text, n=5):
+def extract_svg_colors(svg_text, n=8):
     """Pull dominant colors straight from SVG markup (fill/stroke), since
     Pillow can't rasterize SVG. Weighted by how many shapes use each color,
     counting both CSS-class-defined fills and inline fill/style attributes.
@@ -120,7 +154,7 @@ def is_near_white_or_gray(r, g, b, threshold=18):
     return max(r, g, b) - min(r, g, b) < threshold
 
 
-def extract_colors(image_bytes, n=5):
+def extract_colors(image_bytes, n=8):
     img = Image.open(BytesIO(image_bytes)).convert('RGBA')
 
     background = Image.new('RGBA', img.size, (255, 255, 255, 255))
@@ -148,65 +182,115 @@ def extract_colors(image_bytes, n=5):
     return hex_colors[:n]
 
 
-def analyze_site(url, n_colors=5):
-    """Fetch a site, find its logo, and extract dominant colors.
+def colors_from_asset(asset, n=8):
+    """extract_colors/extract_svg_colors dispatch based on the asset's content type."""
+    if not asset:
+        return []
+    is_svg = 'svg' in asset['content_type'] or asset['url'].lower().endswith('.svg')
+    try:
+        if is_svg:
+            return extract_svg_colors(asset['bytes'].decode('utf-8', errors='ignore'), n=n)
+        return extract_colors(asset['bytes'], n=n)
+    except Exception:
+        return []
 
-    Returns a dict with url, logo_url, logo_bytes, logo_content_type, dominant_colors.
-    Raises ValueError if no logo can be found.
+
+def rank_colors(weighted_colors, n):
+    """Dedupe a list of hex colors (with repeats standing in for weight) into
+    the n most-voted, preserving first-seen order as the tiebreaker.
+    """
+    counts = {}
+    order = []
+    for color in weighted_colors:
+        if color not in counts:
+            order.append(color)
+        counts[color] = counts.get(color, 0) + 1
+    ranked = sorted(order, key=lambda c: counts[c], reverse=True)
+    return ranked[:n]
+
+
+def fetch_first_valid_image(candidate_urls):
+    """Try candidate URLs in order, returning the first that's actually an
+    image. Some sites (SPAs with catch-all routing) return 200 OK with an
+    HTML page for a nonexistent image path, so a URL isn't trustworthy
+    until its response's Content-Type confirms it's really an image.
+    """
+    for candidate_url in candidate_urls:
+        try:
+            resp = requests.get(candidate_url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+        except requests.exceptions.RequestException:
+            continue
+        content_type = resp.headers.get('Content-Type', '')
+        if content_type.startswith('image/'):
+            return {'url': candidate_url, 'bytes': resp.content, 'content_type': content_type}
+    return None
+
+
+def _asset_summary(asset):
+    if not asset:
+        return None
+    return {'url': asset['url'], 'content_type': asset['content_type']}
+
+
+def analyze_site(url, n_colors=6):
+    """Fetch a site and pull its logo, icon, cover image, and brand colors.
+
+    Returns a dict: url, icon, logo, cover_image (each None or
+    {url, bytes, content_type}), and brand_colors (list of hex strings).
+    Raises ValueError if none of icon/logo/cover_image can be found.
     """
     url = url if url.startswith('http') else 'https://' + url
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
 
-    candidates = get_logo_candidates(soup, url)
-    if not candidates:
-        raise ValueError(f'no logo found for {url}')
+    icon = fetch_first_valid_image(find_icon_candidates(soup, url))
+    logo = fetch_first_valid_image(find_logo_candidates(soup, url))
+    cover_image = fetch_first_valid_image(find_cover_image_candidates(soup, url))
 
-    # Some sites (SPAs with catch-all routing) return 200 OK with an HTML
-    # page for a nonexistent image path, so a candidate isn't trustworthy
-    # until its response actually looks like an image.
-    logo_url = None
-    logo_resp = None
-    for candidate_url in candidates:
-        try:
-            candidate_resp = requests.get(candidate_url, headers=HEADERS, timeout=15)
-            candidate_resp.raise_for_status()
-        except requests.exceptions.RequestException:
-            continue
-        if candidate_resp.headers.get('Content-Type', '').startswith('image/'):
-            logo_url = candidate_url
-            logo_resp = candidate_resp
-            break
+    if not icon and not logo and not cover_image:
+        raise ValueError(f'no logo, icon, or cover image found for {url}')
 
-    if not logo_resp:
-        raise ValueError(f'no logo found for {url}')
+    # Most sites don't have a distinct header wordmark separate from their
+    # icon; fall back to showing the icon as the logo in that case.
+    if not logo:
+        logo = icon
 
-    content_type = logo_resp.headers.get('Content-Type', 'image/png')
-    is_svg = 'svg' in content_type or logo_url.lower().endswith('.svg')
+    theme_color = find_theme_color(soup)
 
-    try:
-        if is_svg:
-            colors = extract_svg_colors(logo_resp.text, n=n_colors)
-        else:
-            colors = extract_colors(logo_resp.content, n=n_colors)
-    except Exception:
-        colors = []
+    color_votes = []
+    if theme_color:
+        color_votes.extend([theme_color] * 4)
+    color_votes.extend(colors_from_asset(logo))
+    if icon and icon is not logo:
+        color_votes.extend(colors_from_asset(icon))
+
+    brand_colors = rank_colors(color_votes, n=n_colors)
 
     return {
         'url': url,
-        'logo_url': logo_url,
-        'logo_bytes': logo_resp.content,
-        'logo_content_type': content_type,
-        'dominant_colors': colors,
+        'icon': icon,
+        'logo': logo,
+        'cover_image': cover_image,
+        'brand_colors': brand_colors,
     }
 
 
+def _save_asset(asset, out_dir, domain, label):
+    if not asset:
+        return None
+    ext = Path(urlparse(asset['url']).path).suffix or '.png'
+    path = out_dir / f'{domain}_{label}{ext}'
+    path.write_bytes(asset['bytes'])
+    return str(path)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract a website's logo and dominant colors")
+    parser = argparse.ArgumentParser(description="Extract a website's logo, icon, cover image, and brand colors")
     parser.add_argument('url', help='Website URL, e.g. https://example.com')
-    parser.add_argument('--out', default='.', help='Output directory for the saved logo (default: current dir)')
-    parser.add_argument('--colors', type=int, default=5, help='Number of dominant colors to extract (default: 5)')
+    parser.add_argument('--out', default='.', help='Output directory for saved images (default: current dir)')
+    parser.add_argument('--colors', type=int, default=6, help='Number of brand colors to extract (default: 6)')
     args = parser.parse_args()
 
     try:
@@ -217,16 +301,23 @@ def main():
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ext = Path(urlparse(result['logo_url']).path).suffix or '.png'
     domain = urlparse(result['url']).netloc.replace('.', '_')
-    logo_path = out_dir / f'{domain}_logo{ext}'
-    logo_path.write_bytes(result['logo_bytes'])
 
     print(json.dumps({
         'url': result['url'],
-        'logo_url': result['logo_url'],
-        'logo_saved_to': str(logo_path),
-        'dominant_colors': result['dominant_colors'],
+        'icon': {
+            'url': result['icon']['url'],
+            'saved_to': _save_asset(result['icon'], out_dir, domain, 'icon'),
+        } if result['icon'] else None,
+        'logo': {
+            'url': result['logo']['url'],
+            'saved_to': _save_asset(result['logo'], out_dir, domain, 'logo'),
+        } if result['logo'] else None,
+        'cover_image': {
+            'url': result['cover_image']['url'],
+            'saved_to': _save_asset(result['cover_image'], out_dir, domain, 'cover'),
+        } if result['cover_image'] else None,
+        'brand_colors': result['brand_colors'],
     }, indent=2))
 
 

@@ -200,7 +200,11 @@ def index():
             except requests.exceptions.Timeout:
                 error = f'{url} took too long to respond.'
             except requests.exceptions.HTTPError as e:
-                error = f'{url} returned an error: {e.response.status_code}.'
+                status = e.response.status_code
+                if status in (401, 403):
+                    error = f"{url} blocked this request ({status}) — some sites run bot detection that blocks automated fetches like this one."
+                else:
+                    error = f'{url} returned an error: {status}.'
 
     return render_template_string(PAGE, url=url, result=result, error=error)
 

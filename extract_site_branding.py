@@ -15,7 +15,17 @@ from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
 
-HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; BrandExtractor/1.0)'}
+# A plausible browser header set. Some sites (e.g. Ticketmaster) run bot
+# detection sophisticated enough (TLS/IP fingerprinting) that no header
+# tweak gets past it — this just avoids being an easy, obvious bot.
+HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
 
 LOGO_HINTS = re.compile(r'logo', re.IGNORECASE)
 
